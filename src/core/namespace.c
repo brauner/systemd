@@ -578,7 +578,7 @@ static void drop_outside_root(const char *root_directory, MountEntry *m, unsigne
         *n = t - m;
 }
 
-static int clone_device_node(const char *d, const char *temporary_mount) {
+static int clone_device_node(const char *d, const char *temporary_mount, bool do_mknod) {
         const char *dn;
         struct stat st;
         int r;
@@ -598,11 +598,24 @@ static int clone_device_node(const char *d, const char *temporary_mount) {
 
         dn = strjoina(temporary_mount, d);
 
-        mac_selinux_create_file_prepare(d, st.st_mode);
-        r = mknod(dn, st.st_mode, st.st_rdev);
-        mac_selinux_create_file_clear();
+        if (do_mknod) {
+                mac_selinux_create_file_prepare(d, st.st_mode);
+                r = mknod(dn, st.st_mode, st.st_rdev);
+                mac_selinux_create_file_clear();
+        } else {
+                int fd;
+
+                fd = open(dn, O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+                if (fd < 0) {
+                        if (errno != EEXIST)
+                                return -errno;
+                } else {
+                        close(fd);
+                }
+                r = mount(d, dn, NULL, MS_BIND, NULL);
+        }
         if (r < 0)
-                return log_debug_errno(errno, "mknod failed for %s: %m", d);
+                return log_debug_errno(errno, "%s failed for %s: %m", do_mknod ? "mknod" : "mount", d);
 
         return 1;
 }
@@ -618,6 +631,7 @@ static int mount_private_dev(MountEntry *m) {
 
         char temporary_mount[] = "/tmp/namespace-dev-XXXXXX";
         const char *d, *dev = NULL, *devpts = NULL, *devshm = NULL, *devhugepages = NULL, *devmqueue = NULL, *devlog = NULL, *devptmx = NULL;
+        bool can_mknod = true;
         _cleanup_umask_ mode_t u;
         int r;
 
@@ -658,9 +672,17 @@ static int mount_private_dev(MountEntry *m) {
                         goto fail;
                 }
         } else {
-                r = clone_device_node("/dev/ptmx", temporary_mount);
-                if (r < 0)
-                        goto fail;
+                r = clone_device_node("/dev/ptmx", temporary_mount, can_mknod);
+                if (r < 0) {
+                        if (errno != EPERM)
+                                goto fail;
+
+                        can_mknod = false;
+                        r = clone_device_node("/dev/ptmx", temporary_mount, can_mknod);
+                        if (r < 0)
+                                goto fail;
+                }
+
                 if (r == 0) {
                         r = -ENXIO;
                         goto fail;
@@ -687,7 +709,19 @@ static int mount_private_dev(MountEntry *m) {
         (void) symlink("/run/systemd/journal/dev-log", devlog);
 
         NULSTR_FOREACH(d, devnodes) {
-                r = clone_device_node(d, temporary_mount);
+                if (can_mknod) {
+                        r = clone_device_node(d, temporary_mount, can_mknod);
+                        if (r < 0) {
+                                if (errno != EPERM)
+                                        goto fail;
+
+                                can_mknod = false;
+                        }
+
+                        continue;
+                }
+
+                r = clone_device_node(d, temporary_mount, false);
                 if (r < 0)
                         goto fail;
         }
