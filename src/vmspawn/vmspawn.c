@@ -2106,33 +2106,31 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_oom();
         }
 
-        /* if we are going to be starting any units with state then create our runtime dir */
-        _cleanup_free_ char *runtime_dir = NULL;
+        /* Create our runtime directory. We need this for the QMP varlink control socket, and also for
+         * TPM state, virtiofsd sockets, runtime mounts, and SSH key material. */
+        _cleanup_free_ char *runtime_dir = NULL, *runtime_subdir = NULL;
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir_destroy = NULL;
-        if (arg_tpm != 0 || arg_directory || arg_runtime_mounts.n_mounts != 0 || arg_pass_ssh_key) {
-                _cleanup_free_ char *subdir = NULL;
 
-                if (asprintf(&subdir, "systemd/vmspawn.%" PRIx64, random_u64()) < 0)
-                        return log_oom();
+        if (asprintf(&runtime_subdir, "systemd/vmspawn.%" PRIx64, random_u64()) < 0)
+                return log_oom();
 
-                r = runtime_directory(arg_runtime_scope, subdir, &runtime_dir);
+        r = runtime_directory(arg_runtime_scope, runtime_subdir, &runtime_dir);
+        if (r < 0)
+                return log_error_errno(r, "Failed to lookup runtime directory: %m");
+        if (r > 0) { /* We need to create our own runtime dir */
+                r = mkdir_p(runtime_dir, 0755);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to lookup runtime directory: %m");
-                if (r > 0) { /* We need to create our own runtime dir */
-                        r = mkdir_p(runtime_dir, 0755);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to create runtime directory '%s': %m", runtime_dir);
+                        return log_error_errno(r, "Failed to create runtime directory '%s': %m", runtime_dir);
 
-                        /* We created this, hence also destroy it */
-                        runtime_dir_destroy = TAKE_PTR(runtime_dir);
+                /* We created this, hence also destroy it */
+                runtime_dir_destroy = TAKE_PTR(runtime_dir);
 
-                        runtime_dir = strdup(runtime_dir_destroy);
-                        if (!runtime_dir)
-                                return log_oom();
-                }
-
-                log_debug("Using runtime directory: %s", runtime_dir);
+                runtime_dir = strdup(runtime_dir_destroy);
+                if (!runtime_dir)
+                        return log_oom();
         }
+
+        log_debug("Using runtime directory: %s", runtime_dir);
 
         _cleanup_close_ int delegate_userns_fd = -EBADF, tap_fd = -EBADF;
         if (arg_network_stack == NETWORK_STACK_TAP) {
@@ -2897,6 +2895,25 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_error_errno(r, "Failed to call getsockname on VSOCK: %m");
         }
 
+        /* Create QMP socketpair for QEMU machine monitor control. FORK_CLOEXEC_OFF clears CLOEXEC on
+         * pass_fds in the child, so we don't need to do it manually here (same as TAP and VSOCK fds). */
+        _cleanup_close_pair_ int qmp_fds[2] = EBADF_PAIR;
+        if (socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, qmp_fds) < 0)
+                return log_error_errno(errno, "Failed to create QMP socketpair: %m");
+
+        if (!GREEDY_REALLOC(pass_fds, n_pass_fds + 1))
+                return log_oom();
+        pass_fds[n_pass_fds++] = qmp_fds[1];
+
+        r = strv_extend(&cmdline, "-chardev");
+        if (r < 0)
+                return log_oom();
+        r = strv_extendf(&cmdline, "socket,id=qmp,fd=%d", qmp_fds[1]);
+        if (r < 0)
+                return log_oom();
+        r = strv_extend_many(&cmdline, "-mon", "chardev=qmp,mode=control");
+        if (r < 0)
+                return log_oom();
         const char *e = secure_getenv("SYSTEMD_VMSPAWN_QEMU_EXTRA");
         if (e) {
                 r = strv_split_and_extend_full(&cmdline, e,
@@ -2937,6 +2954,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         /* Close relevant fds we passed to qemu in the parent. We don't need them anymore. */
         child_vsock_fd = safe_close(child_vsock_fd);
+        qmp_fds[1] = safe_close(qmp_fds[1]);
         tap_fd = safe_close(tap_fd);
 
         if (!arg_keep_unit) {
