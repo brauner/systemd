@@ -108,6 +108,15 @@ int userns_restrict_install(
         if (r < 0)
                 return log_error_errno(r, "Failed to size userns setgroups deny hash table: %m");
 
+        /* Since v7.4 the kernel tells LSMs about namespaces being freed. Prefer that over the kprobe, as
+         * kprobes are no stable interface. LSM hooks show up in the kernel's BTF as bpf_lsm_<hook>(). */
+        bool namespace_free = bpf_kernel_has_kfunc("bpf_lsm_namespace_free");
+        r = sym_bpf_program__set_autoload(namespace_free ? obj->progs.userns_restrict_retire_userns_sysctls
+                                                         : obj->progs.userns_restrict_namespace_free, false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to disable %s BPF program: %m",
+                                       namespace_free ? "kprobe" : "namespace_free");
+
         r = userns_restrict_bpf__load(obj);
         if (r < 0)
                 return log_error_errno(r, "Failed to load BPF object: %m");
@@ -153,6 +162,10 @@ int userns_restrict_attach(struct userns_restrict_bpf *obj, bool pin) {
          * Remove the pins created here, so that destroying the object detaches the programs. */
         _cleanup_(unpin_links_and_freep) char **pinned = NULL;
 
+        /* userns_restrict_install() loads only one of the programs telling us about namespaces being freed.
+         * A previous version of ours may have pinned the other one, which we drop further down. */
+        _cleanup_strv_free_ char **obsolete = NULL;
+
         for (int i = 0; i < obj->skeleton->prog_cnt; i++) {
                 _cleanup_(bpf_link_freep) struct bpf_link *link = NULL;
                 struct bpf_prog_skeleton *ps = obj->skeleton->progs + i;
@@ -167,7 +180,15 @@ int userns_restrict_attach(struct userns_restrict_bpf *obj, bool pin) {
                         fn = path_join(PROGRAM_LINK_PREFIX, e);
                         if (!fn)
                                 return log_oom();
+                }
 
+                if (!sym_bpf_program__autoload(*ps->prog)) {
+                        if (fn && strv_consume(&obsolete, TAKE_PTR(fn)) < 0)
+                                return log_oom();
+                        continue;
+                }
+
+                if (pin) {
                         link = sym_bpf_link__open(fn);
                         r = bpf_get_error_translated(link);
                         if (r < 0) {
@@ -210,8 +231,10 @@ int userns_restrict_attach(struct userns_restrict_bpf *obj, bool pin) {
         /* Only now that our own programs enforce the policy, drop the ones the previous version left
          * pinned. Removing their links detaches them, so doing this any earlier would hand the namespaces
          * that predate an upgrade a stretch with no policy attached at all. */
-        if (pin)
+        if (pin) {
+                obsolete = unpin_links_and_free(obsolete);
                 (void) rm_rf(OBSOLETE_LINK_PREFIX, REMOVE_PHYSICAL);
+        }
 
         return 0;
 #else

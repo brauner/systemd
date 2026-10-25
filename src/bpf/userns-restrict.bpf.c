@@ -69,6 +69,9 @@ void* bpf_rdonly_cast(const void *, __u32) __ksym;
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
 #define CGROUP2_SUPER_MAGIC 0x63677270
 
+/* From include/uapi/linux/sched.h, which vmlinux.h does not provide either. */
+#define CLONE_NEWUSER 0x10000000
+
 struct {
         __uint(type, BPF_MAP_TYPE_HASH);
         __uint(max_entries, 1);        /* placeholder, configured otherwise by nsresourced */
@@ -601,15 +604,8 @@ int BPF_PROG(userns_restrict_task_fix_setgroups, struct cred *new_cred, const st
         return -EPERM;
 }
 
-SEC("kprobe/retire_userns_sysctls")
-int BPF_KPROBE(userns_restrict_retire_userns_sysctls, struct user_namespace *userns) {
-        unsigned inode;
-
-        /* Inform userspace that a user namespace just went away. I wish there was a nicer way to hook into
-         * user namespaces being deleted than using kprobes, but couldn't find any. */
-        userns = bpf_rdonly_cast(userns, bpf_core_type_id_kernel(struct user_namespace));
-        inode = userns->ns.inum;
-
+/* Informs userspace that a user namespace just went away. */
+static void notify_userns_freed(unsigned inode) {
         /* Check each map separately to avoid the compiler merging the two lookups into a pointer OR
          * operation, which the BPF verifier rejects. */
         if (bpf_map_lookup_elem(&userns_managed, &inode))
@@ -619,10 +615,35 @@ int BPF_KPROBE(userns_restrict_retire_userns_sysctls, struct user_namespace *use
                 goto notify;
 
         /* No rules installed for this userns? Then send no notification. */
-        return 0;
+        return;
 
 notify:
         bpf_ringbuf_output(&userns_ringbuf, &inode, sizeof(inode), 0);
+}
+
+/* ns_type only made it into struct ns_common with kernel v6.18. Declare it as a CO-RE "type flavor" (see
+ * the overlayfs ones above), so that we keep building against a vmlinux.h that predates it. */
+struct ns_common___local {
+        u32 ns_type;
+} __attribute__((preserve_access_index));
+
+/* Since kernel v7.4 the LSM layer is told about every namespace that is freed. userns-restrict.c only loads
+ * one of this program and the kprobe below, depending on whether the running kernel has this hook. */
+SEC("lsm/namespace_free")
+int BPF_PROG(userns_restrict_namespace_free, struct ns_common *ns) {
+        if (((struct ns_common___local*) ns)->ns_type != CLONE_NEWUSER)
+                return 0;
+
+        notify_userns_freed(ns->inum);
+        return 0;
+}
+
+SEC("kprobe/retire_userns_sysctls")
+int BPF_KPROBE(userns_restrict_retire_userns_sysctls, struct user_namespace *userns) {
+        /* Older kernels have no LSM hook for namespaces being freed, hence hook into a function every user
+         * namespace passes through on its way out. */
+        userns = bpf_rdonly_cast(userns, bpf_core_type_id_kernel(struct user_namespace));
+        notify_userns_freed(userns->ns.inum);
         return 0;
 }
 
