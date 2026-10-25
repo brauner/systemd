@@ -39,6 +39,9 @@ executables += [
                 'sources' : test_userns_restrict_sources,
                 'conditions' : ['HAVE_VMLINUX_H'],
                 'import' : ['systemd-nsresourced'],
+                'dependencies' : [
+                        libbpf_cflags,
+                ],
                 'bpf_programs': ['userns-restrict'],
         },
 ]

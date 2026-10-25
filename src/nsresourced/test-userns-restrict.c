@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "bpf-link.h"
+#include "bpf-util.h"
 #include "cgroup-setup.h"
 #include "cgroup-util.h"
 #include "errno-util.h"
@@ -21,7 +23,9 @@
 #include "tests.h"
 #include "tmpfile-util.h"
 #include "uid-classification.h"
+#include "unaligned.h"
 #include "user-util.h"
+#include "userns-restrict-skel.h"
 #include "userns-restrict.h"
 
 static int make_tmpfs_fsmount(void) {
@@ -523,6 +527,49 @@ TEST(setgroups_deny) {
                 ASSERT_OK_ERRNO(eventfd_write(bfd, 1));
 
                 ASSERT_OK(pidref_wait_for_terminate_and_check("(test-allow)", &pidref, WAIT_LOG));
+        }
+}
+
+static int on_userns_freed(void *userdata, void *data, size_t size) {
+        uint64_t *inode = ASSERT_PTR(userdata);
+
+        /* User namespaces registered by the other tests may show up here as well. */
+        if (size == sizeof(unsigned) && unaligned_read_ne32(data) == *inode)
+                *inode = 0;
+
+        return 0;
+}
+
+TEST(userns_restrict_free_notification) {
+        _cleanup_(bpf_ring_buffer_freep) struct ring_buffer *rb = NULL;
+        _cleanup_close_ int userns_fd = -EBADF;
+        _cleanup_free_ char *idmap = NULL;
+        uint64_t inode;
+        struct stat st;
+
+        /* Exactly one of the two programs telling us about freed user namespaces is loaded. */
+        ASSERT_NE(sym_bpf_program__autoload(bpf_obj->progs.userns_restrict_namespace_free),
+                  sym_bpf_program__autoload(bpf_obj->progs.userns_restrict_retire_userns_sysctls));
+        log_info("Using the %s to get notified about freed user namespaces.",
+                 sym_bpf_program__autoload(bpf_obj->progs.userns_restrict_namespace_free) ?
+                 "namespace_free LSM hook" : "retire_userns_sysctls() kprobe");
+
+        ASSERT_OK(asprintf(&idmap, "0 "UID_FMT" 1", CONTAINER_UID_MIN));
+        userns_fd = ASSERT_OK(userns_acquire(idmap, idmap, /* setgroups_deny= */ true));
+        ASSERT_OK_ERRNO(fstat(userns_fd, &st));
+        inode = st.st_ino;
+
+        ASSERT_OK(userns_restrict_register_by_fd(bpf_obj, userns_fd));
+
+        rb = sym_ring_buffer__new(sym_bpf_map__fd(bpf_obj->maps.userns_ringbuf), on_userns_freed, &inode, NULL);
+        ASSERT_NOT_NULL(rb);
+
+        /* Drop the last reference, the kernel then frees the user namespace asynchronously. */
+        userns_fd = safe_close(userns_fd);
+
+        for (unsigned i = 0; inode != 0; i++) {
+                ASSERT_LT(i, 300U); /* 30s */
+                ASSERT_OK(sym_ring_buffer__poll(rb, 100));
         }
 }
 
